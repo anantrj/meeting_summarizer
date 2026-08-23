@@ -1,176 +1,171 @@
+// server.js
+// Meeting Summarizer backend — local Whisper transcription + Gemini summarization
+//
+// CHANGES FROM ORIGINAL AWS VERSION:
+//   REMOVED: AWS SDK (S3 client), presigned URL generation (/get-upload-url),
+//            S3-based polling for Lambda-generated summary (/get-summary)
+//   REMOVED: multer.memoryStorage() (buffer never touched disk before)
+//   ADDED:   multer.diskStorage() — saves upload locally so Whisper can read the file path
+//   ADDED:   spawn() call to transcribe.py (local Whisper) — replaces Lambda transcription
+//   ADDED:   direct Gemini API call — replaces whatever Lambda used to call for summarization
+//   KEPT:    /upload-video route name and response shape, so frontend changes are minimal
+//   NEW:     synchronous flow — upload -> transcribe -> summarize -> respond in ONE request
+//            (previously: upload -> poll a separate endpoint later for the result)
+
 import express from "express";
-import AWS from "aws-sdk";
 import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { spawn } from "child_process";
+import { fileURLToPath } from "url";
 
 dotenv.config();
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
 
-// ✅ Enable CORS for all origins (for development)
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Parse JSON bodies
 app.use(express.json());
 
-// Configure multer for file uploads
-const upload = multer({ storage: multer.memoryStorage() });
+// ---------------------------------------------------------------------------
+// Local upload storage (replaces S3 input bucket + presigned URL flow)
+// ---------------------------------------------------------------------------
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
 
-const s3 = new AWS.S3({
-  region: "ap-south-1",
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
 });
 
-app.get("/get-upload-url", async (req, res) => {
-  try {
-    const filename = req.query.filename || req.query.fileName;
-    const filetype = req.query.filetype || req.query.fileType || 'video/mp4';
+const upload = multer({ storage });
 
-    if (!filename) {
-      return res.status(400).json({ error: "Missing filename parameter" });
-    }
+// ---------------------------------------------------------------------------
+// Whisper transcription (replaces Lambda transcription step)
+// ---------------------------------------------------------------------------
+// IMPORTANT: point this at your venv's python3, not system python3,
+// since Whisper was installed inside aws_video_summarizer/backend/venv
+const PYTHON_PATH = path.join(__dirname, "venv", "bin", "python3");
 
-    const params = {
-      Bucket: "video-input-nahul",
-      Key: `uploads/${Date.now()}-${filename}`,
-      Expires: 60,
-      ContentType: filetype
-    };
+function transcribeAudio(filePath) {
+  return new Promise((resolve, reject) => {
+    const pythonProcess = spawn(PYTHON_PATH, [
+      path.join(__dirname, "transcribe.py"),
+      filePath
+    ]);
 
-    const url = await s3.getSignedUrlPromise("putObject", params);
-    console.log("Generated upload URL for:", params.Key);
-    res.json({ url, key: params.Key });
-  } catch (error) {
-    console.error("Error generating upload URL:", error);
-    res.status(500).json({ error: "Failed to generate upload URL" });
-  }
-});
+    let stdout = "";
+    let stderr = "";
 
-const SUMMARY_BUCKET = "summary-output-nahul";
+    pythonProcess.stdout.on("data", (data) => { stdout += data.toString(); });
+    pythonProcess.stderr.on("data", (data) => { stderr += data.toString(); });
 
-app.get("/get-summary", async (req, res) => {
-  const rawKey = (req.query.key || req.query.filename || "").toString().trim();
-
-  if (!rawKey) {
-    return res.status(400).json({ error: "Missing filename or key query parameter" });
-  }
-
-  const pathParts = rawKey.split("/").filter(Boolean);
-  const fileNameWithExt = pathParts[pathParts.length - 1] || rawKey;
-  const dotIndex = fileNameWithExt.lastIndexOf(".");
-  const nameWithoutExt = dotIndex !== -1 ? fileNameWithExt.substring(0, dotIndex) : fileNameWithExt;
-
-  if (!nameWithoutExt) {
-    return res.status(400).json({ error: "Invalid filename supplied" });
-  }
-
-  const timestampStripped = nameWithoutExt.replace(/^\d+-/, "");
-  const transcriptStripped = timestampStripped.replace(/_transcript(_summary)?$/, "");
-  const targetSuffix = `${transcriptStripped}_transcript_summary.txt`;
-
-  const findSummaryObject = async () => {
-    let continuationToken;
-    let latestMatch = null;
-
-    do {
-      const response = await s3
-        .listObjectsV2({
-          Bucket: SUMMARY_BUCKET,
-          ContinuationToken: continuationToken
-        })
-        .promise();
-
-      const matches =
-        response.Contents?.filter(
-          (object) =>
-            object.Key &&
-            object.Key.endsWith(targetSuffix)
-        ) || [];
-
-      if (matches.length) {
-        matches.forEach((object) => {
-          if (
-            !latestMatch ||
-            new Date(object.LastModified) > new Date(latestMatch.LastModified)
-          ) {
-            latestMatch = object;
-          }
-        });
+    pythonProcess.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(`Whisper process failed: ${stderr}`));
       }
+      try {
+        const parsed = JSON.parse(stdout);
+        if (parsed.error) return reject(new Error(parsed.error));
+        resolve(parsed.transcript);
+      } catch (err) {
+        reject(new Error(`Failed to parse Whisper output: ${stdout}`));
+      }
+    });
+  });
+}
 
-      continuationToken = response.IsTruncated
-        ? response.NextContinuationToken
-        : undefined;
-    } while (continuationToken && !latestMatch);
+// ---------------------------------------------------------------------------
+// Gemini summarization (replaces whatever Lambda used to call)
+// ---------------------------------------------------------------------------
+async function summarizeTranscript(transcript) {
+  const apiKey = process.env.GEMINI_API_KEY;
 
-    return latestMatch;
-  };
+  const prompt = `You are an assistant that summarizes meeting transcripts.
 
-  try {
-    const summaryObject = await findSummaryObject();
+Given the transcript below, return your response in the following structure:
 
-    if (!summaryObject?.Key) {
-      return res.status(404).json({ error: "Summary not found for this file" });
+## Summary
+A short paragraph summarizing what the meeting was about.
+
+## Key Decisions
+- Bullet list of decisions that were made during the meeting.
+
+## Action Items
+- Bullet list of tasks that came out of the meeting.
+- Include the owner and deadline if mentioned in the transcript.
+
+Transcript:
+"""
+${transcript}
+"""`;
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
     }
+  );
 
-    const data = await s3
-      .getObject({
-        Bucket: SUMMARY_BUCKET,
-        Key: summaryObject.Key
-      })
-      .promise();
+  const data = await response.json();
 
-    const summary = data.Body.toString("utf-8");
-    res.json({ summary, key: summaryObject.Key });
-  } catch (error) {
-    console.error("Error retrieving summary from S3:", error);
-
-    if (error.code === "NoSuchKey") {
-      return res.status(404).json({ error: "Summary not found for this file" });
-    }
-
-    res.status(500).json({ error: "Failed to retrieve summary" });
+  if (!response.ok) {
+    throw new Error(`Gemini API error: ${JSON.stringify(data)}`);
   }
-});
 
-// ✅ NEW: Direct file upload endpoint
-app.post("/upload-video", upload.single('video'), async (req, res) => {
+  const summaryText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!summaryText) {
+    throw new Error("Gemini API returned no summary text");
+  }
+
+  return summaryText;
+}
+
+// ---------------------------------------------------------------------------
+// Route: upload -> transcribe -> summarize -> respond (all in one request)
+// Kept the route name "/upload-video" and field name "video" from your
+// original code, so your frontend's upload call doesn't need to change.
+// ---------------------------------------------------------------------------
+app.post("/upload-video", upload.single("video"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No file provided" });
+  }
+
+  const filePath = req.file.path;
+
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file provided" });
-    }
+    console.log(`Transcribing: ${filePath}`);
+    const transcript = await transcribeAudio(filePath);
 
-    const originalFilename = req.file.originalname;
-    const timestamp = Date.now();
-    const key = `uploads/${timestamp}-${originalFilename}`;
+    console.log("Summarizing transcript with Gemini...");
+    const summary = await summarizeTranscript(transcript);
 
-    console.log(`Uploading file: ${originalFilename} to S3 as: ${key}`);
-
-    const params = {
-      Bucket: "video-input-nahul",
-      Key: key,
-      Body: req.file.buffer,
-      ContentType: req.file.mimetype
-    };
-
-    await s3.upload(params).promise();
-    
-    console.log(`File uploaded successfully to S3: ${key}`);
-    res.json({ 
+    res.json({
       success: true,
-      key: key,
-      message: "File uploaded successfully"
+      transcript,
+      summary
     });
   } catch (error) {
-    console.error("Error uploading file to S3:", error);
-    res.status(500).json({ error: "Failed to upload file to S3" });
+    console.error("Error processing file:", error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    fs.unlink(filePath, (err) => {
+      if (err) console.error("Failed to delete temp file:", err);
+    });
   }
 });
 
-app.listen(4000, () => console.log("Server running on port 4000")       );
+app.listen(4000, () => console.log("Server running on port 4000"));
