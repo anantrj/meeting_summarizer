@@ -39,7 +39,7 @@ Frontend displays transcript + summary
 │   ├── transcribe.py       # Whisper transcription script
 │   ├── requirements.txt    # Python dependencies
 │   └── .env.example        # Environment variable template
-├── frontend/
+├── meeting_summarizer/
 │   └── src/
 │       └── components/
 │           └── MeetingSummarizer.jsx   # Main upload + results UI
@@ -89,7 +89,7 @@ Runs on `http://localhost:4000`.
 ### 2. Frontend
 
 ```bash
-cd frontend
+cd meeting_summarizer
 npm install
 npm run dev
 ```
