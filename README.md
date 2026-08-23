@@ -89,7 +89,7 @@ Runs on `http://localhost:4000`.
 ### 2. Frontend
 
 ```bash
-cd frontend
+cd meeting_summarizer
 npm install
 npm run dev
 ```
